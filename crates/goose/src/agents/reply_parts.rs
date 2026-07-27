@@ -284,6 +284,10 @@ impl Agent {
         skip(provider, model_config, session_id, system_prompt, messages, tools, toolshim_tools),
         fields(session.id = %session_id)
     )]
+    /// Returns the message stream plus whether the provider's HTTP stream was
+    /// established. Only errors after establishment are eligible for the
+    /// agent-level mid-stream retry; establishment failures were already
+    /// retried inside the provider.
     pub(crate) async fn stream_response_from_provider(
         provider: Arc<dyn Provider>,
         model_config: ModelConfig,
@@ -292,7 +296,7 @@ impl Agent {
         messages: &[Message],
         tools: &[Tool],
         toolshim_tools: &[Tool],
-    ) -> Result<MessageStream, ProviderError> {
+    ) -> Result<(MessageStream, bool), ProviderError> {
         let config = model_config.clone();
 
         let projected_messages =
@@ -338,13 +342,14 @@ impl Agent {
                 let enhanced_error = enhance_model_error(e, &provider, config.toolshim).await;
                 // Return a stream that immediately yields the error
                 // This allows the error to be caught by existing error handling in agent.rs
-                return Ok(Box::pin(try_stream! {
+                let error_stream: MessageStream = Box::pin(try_stream! {
                     yield Err(enhanced_error)?;
-                }));
+                });
+                return Ok((error_stream, false));
             }
         };
 
-        Ok(Box::pin(try_stream! {
+        let message_stream: MessageStream = Box::pin(try_stream! {
             if config.toolshim {
                 // Toolshim mode: accumulate the full response before processing
                 // so that tool-use markers spanning multiple chunks are detected
@@ -418,7 +423,8 @@ impl Agent {
                     yield (message, usage);
                 }
             }
-        }))
+        });
+        Ok((message_stream, true))
     }
 
     /// Categorize tool requests from the response into different types

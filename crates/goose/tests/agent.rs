@@ -831,6 +831,443 @@ mod tests {
     }
 
     #[cfg(test)]
+    mod network_error_retry_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use goose::agents::{AgentConfig, SessionConfig};
+        use goose::config::permission::PermissionManager;
+        use goose::config::GooseMode;
+        use goose::conversation::message::{Message, MessageContent};
+        use goose::providers::base::{
+            stream_from_single_message, MessageStream, Provider, ProviderDef, ProviderMetadata,
+        };
+        use goose::session::session_manager::SessionType;
+        use goose::session::SessionManager;
+        use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+        use goose_providers::errors::ProviderError;
+        use goose_providers::model::ModelConfig;
+        use goose_providers::retry::RetryConfig;
+        use rmcp::model::{CallToolRequestParams, Tool};
+        use rmcp::object;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tempfile::TempDir;
+
+        const PARTIAL_TEXT: &str = "Partial response before the stream died";
+        const RECOVERED_TEXT: &str = "Recovered after the network error.";
+
+        struct FlakyStreamProvider {
+            call_count: AtomicUsize,
+            failures: usize,
+            fail_at_creation: bool,
+            fail_before_first_item: bool,
+        }
+
+        impl FlakyStreamProvider {
+            fn new(failures: usize) -> Self {
+                Self {
+                    call_count: AtomicUsize::new(0),
+                    failures,
+                    fail_at_creation: false,
+                    fail_before_first_item: false,
+                }
+            }
+
+            fn new_failing_creation() -> Self {
+                Self {
+                    call_count: AtomicUsize::new(0),
+                    failures: usize::MAX,
+                    fail_at_creation: true,
+                    fail_before_first_item: false,
+                }
+            }
+
+            fn new_failing_before_first_item() -> Self {
+                Self {
+                    call_count: AtomicUsize::new(0),
+                    failures: 1,
+                    fail_at_creation: false,
+                    fail_before_first_item: true,
+                }
+            }
+        }
+
+        impl goose::providers::base::ProviderDescriptor for FlakyStreamProvider {
+            fn metadata() -> ProviderMetadata {
+                ProviderMetadata {
+                    name: "mock-flaky-stream".to_string(),
+                    display_name: "Mock Flaky Stream Provider".to_string(),
+                    description: "Mock provider for mid-stream network error tests".to_string(),
+                    default_model: "mock-model".to_string(),
+                    known_models: vec![],
+                    model_doc_link: "".to_string(),
+                    config_keys: vec![],
+                    setup_steps: vec![],
+                    model_selection_hint: None,
+                    fast_model: None,
+                }
+            }
+        }
+
+        impl ProviderDef for FlakyStreamProvider {
+            type Provider = Self;
+
+            fn from_env(
+                _extensions: Vec<goose::config::ExtensionConfig>,
+                _tls_config: Option<goose::providers::api_client::TlsConfig>,
+            ) -> futures::future::BoxFuture<'static, anyhow::Result<Self>> {
+                Box::pin(async { Ok(Self::new(1)) })
+            }
+        }
+
+        #[async_trait]
+        impl Provider for FlakyStreamProvider {
+            async fn stream(
+                &self,
+                _model_config: &ModelConfig,
+                _system_prompt: &str,
+                _messages: &[Message],
+                _tools: &[Tool],
+            ) -> Result<MessageStream, ProviderError> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if self.fail_at_creation {
+                    return Err(ProviderError::NetworkError(
+                        "error sending request".to_string(),
+                    ));
+                }
+                if n < self.failures {
+                    let error = Err(ProviderError::NetworkError(
+                        "Stream decode error: error decoding response body".to_string(),
+                    ));
+                    let items = if self.fail_before_first_item {
+                        vec![error]
+                    } else {
+                        let partial = Message::assistant().with_text(PARTIAL_TEXT);
+                        vec![Ok((Some(partial), None)), error]
+                    };
+                    Ok(Box::pin(futures::stream::iter(items)))
+                } else {
+                    let usage = ProviderUsage::new(
+                        "mock-model".to_string(),
+                        Usage::new(Some(10), Some(5), Some(15)),
+                    );
+                    Ok(stream_from_single_message(
+                        Message::assistant().with_text(RECOVERED_TEXT),
+                        usage,
+                    ))
+                }
+            }
+
+            fn retry_config(&self) -> RetryConfig {
+                RetryConfig::new(2, 1, 1.0, 5)
+            }
+
+            fn get_name(&self) -> &str {
+                "mock-flaky-stream"
+            }
+        }
+
+        struct ToolThenFlakyProvider {
+            call_count: AtomicUsize,
+            received: Mutex<Vec<Vec<Message>>>,
+        }
+
+        impl ToolThenFlakyProvider {
+            fn new() -> Self {
+                Self {
+                    call_count: AtomicUsize::new(0),
+                    received: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn usage() -> ProviderUsage {
+                ProviderUsage::new(
+                    "mock-model".to_string(),
+                    Usage::new(Some(10), Some(5), Some(15)),
+                )
+            }
+        }
+
+        impl goose::providers::base::ProviderDescriptor for ToolThenFlakyProvider {
+            fn metadata() -> ProviderMetadata {
+                ProviderMetadata {
+                    name: "mock-tool-then-flaky".to_string(),
+                    display_name: "Mock Tool Then Flaky Provider".to_string(),
+                    description: "Mock provider for tool-pair retry tests".to_string(),
+                    default_model: "mock-model".to_string(),
+                    known_models: vec![],
+                    model_doc_link: "".to_string(),
+                    config_keys: vec![],
+                    setup_steps: vec![],
+                    model_selection_hint: None,
+                    fast_model: None,
+                }
+            }
+        }
+
+        impl ProviderDef for ToolThenFlakyProvider {
+            type Provider = Self;
+
+            fn from_env(
+                _extensions: Vec<goose::config::ExtensionConfig>,
+                _tls_config: Option<goose::providers::api_client::TlsConfig>,
+            ) -> futures::future::BoxFuture<'static, anyhow::Result<Self>> {
+                Box::pin(async { Ok(Self::new()) })
+            }
+        }
+
+        #[async_trait]
+        impl Provider for ToolThenFlakyProvider {
+            async fn stream(
+                &self,
+                _model_config: &ModelConfig,
+                _system_prompt: &str,
+                messages: &[Message],
+                _tools: &[Tool],
+            ) -> Result<MessageStream, ProviderError> {
+                self.received.lock().unwrap().push(messages.to_vec());
+                match self.call_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        let tool_call = CallToolRequestParams::new("test_tool")
+                            .with_arguments(object!({"param": "value"}));
+                        let message =
+                            Message::assistant().with_tool_request("call_1", Ok(tool_call));
+                        Ok(stream_from_single_message(message, Self::usage()))
+                    }
+                    1 => {
+                        let partial = Message::assistant().with_text(PARTIAL_TEXT);
+                        Ok(Box::pin(futures::stream::iter(vec![
+                            Ok((Some(partial), None)),
+                            Err(ProviderError::NetworkError(
+                                "Stream decode error: error decoding response body".to_string(),
+                            )),
+                        ])))
+                    }
+                    _ => Ok(stream_from_single_message(
+                        Message::assistant().with_text(RECOVERED_TEXT),
+                        Self::usage(),
+                    )),
+                }
+            }
+
+            fn retry_config(&self) -> RetryConfig {
+                RetryConfig::new(2, 1, 1.0, 5)
+            }
+
+            fn get_name(&self) -> &str {
+                "mock-tool-then-flaky"
+            }
+        }
+
+        fn count_content(messages: &[Message], is_match: fn(&MessageContent) -> bool) -> usize {
+            messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter(|c| is_match(c))
+                .count()
+        }
+
+        async fn run_reply<P: Provider + 'static>(
+            provider: Arc<P>,
+            max_turns: u32,
+        ) -> Result<(Vec<Message>, Vec<Message>)> {
+            let temp_dir = TempDir::new().unwrap();
+            let data_dir = temp_dir.path().to_path_buf();
+            let session_manager = Arc::new(SessionManager::new(data_dir.clone()));
+            let agent = Agent::with_config(AgentConfig::new(
+                session_manager.clone(),
+                Arc::new(PermissionManager::new(data_dir)),
+                None,
+                GooseMode::default(),
+                true,
+                GoosePlatform::GooseCli,
+            ));
+
+            let session = session_manager
+                .create_session(
+                    PathBuf::default(),
+                    "network-error-retry-test".to_string(),
+                    SessionType::Hidden,
+                    GooseMode::default(),
+                )
+                .await?;
+
+            agent
+                .update_provider(
+                    provider.clone(),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
+                .await?;
+
+            let session_config = SessionConfig {
+                id: session.id.clone(),
+                schedule_id: None,
+                max_turns: Some(max_turns),
+                retry_config: None,
+            };
+
+            let reply_stream = agent
+                .reply(Message::user().with_text("Hello"), session_config, None)
+                .await?;
+            tokio::pin!(reply_stream);
+
+            let mut yielded = Vec::new();
+            while let Some(event) = reply_stream.next().await {
+                if let Ok(AgentEvent::Message(message)) = event {
+                    yielded.push(message);
+                }
+            }
+
+            let final_session = session_manager.get_session(&session.id, true).await?;
+            let history = final_session
+                .conversation
+                .expect("Session should have a conversation")
+                .messages()
+                .clone();
+
+            Ok((yielded, history))
+        }
+
+        fn concat_texts(messages: &[Message]) -> String {
+            messages
+                .iter()
+                .map(|m| m.as_concat_text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[tokio::test]
+        async fn test_network_error_mid_stream_is_retried() -> Result<()> {
+            let provider = Arc::new(FlakyStreamProvider::new(1));
+            let (yielded, history) = run_reply(provider.clone(), 5).await?;
+
+            let yielded_text = concat_texts(&yielded);
+            assert!(
+                yielded_text.contains(RECOVERED_TEXT),
+                "expected the retried turn to complete; yielded: {yielded_text}"
+            );
+            assert!(
+                !yielded_text.contains("Please resend your message"),
+                "a retried network error must not surface the terminal error message"
+            );
+            assert_eq!(
+                provider.call_count.load(Ordering::SeqCst),
+                2,
+                "provider should have been called again after the stream died"
+            );
+
+            let history_text = concat_texts(&history);
+            assert!(history_text.contains(RECOVERED_TEXT));
+            assert!(
+                !history_text.contains(PARTIAL_TEXT),
+                "the interrupted partial turn must not be persisted to history"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_network_error_retries_exhausted_ends_turn() -> Result<()> {
+            let provider = Arc::new(FlakyStreamProvider::new(usize::MAX));
+            let (yielded, history) = run_reply(provider.clone(), 5).await?;
+
+            let yielded_text = concat_texts(&yielded);
+            assert!(
+                yielded_text.contains("Please resend your message to try again."),
+                "exhausted retries should surface the terminal error message; yielded: {yielded_text}"
+            );
+            assert_eq!(
+                provider.call_count.load(Ordering::SeqCst),
+                3,
+                "expected the initial attempt plus max_retries further attempts"
+            );
+
+            let history_text = concat_texts(&history);
+            assert!(
+                history_text.matches(PARTIAL_TEXT).count() <= 1,
+                "retried attempts must not accumulate duplicate partial turns in history"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_network_error_at_stream_creation_is_not_retried() -> Result<()> {
+            let provider = Arc::new(FlakyStreamProvider::new_failing_creation());
+            let (yielded, _history) = run_reply(provider.clone(), 5).await?;
+
+            let yielded_text = concat_texts(&yielded);
+            assert!(
+                yielded_text.contains("Please resend your message to try again."),
+                "creation failures are already retried inside the provider and must be terminal here; yielded: {yielded_text}"
+            );
+            assert_eq!(
+                provider.call_count.load(Ordering::SeqCst),
+                1,
+                "the agent loop must not stack its retry budget on top of the provider's"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_network_error_before_first_item_on_established_stream_is_retried(
+        ) -> Result<()> {
+            let provider = Arc::new(FlakyStreamProvider::new_failing_before_first_item());
+            let (yielded, _history) = run_reply(provider.clone(), 5).await?;
+
+            let yielded_text = concat_texts(&yielded);
+            assert!(
+                yielded_text.contains(RECOVERED_TEXT),
+                "a stream that dies after establishment but before yielding anything must be retried; yielded: {yielded_text}"
+            );
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_network_error_after_tool_call_keeps_tool_pair() -> Result<()> {
+            let provider = Arc::new(ToolThenFlakyProvider::new());
+            let (yielded, history) = run_reply(provider.clone(), 2).await?;
+
+            let yielded_text = concat_texts(&yielded);
+            assert!(
+                yielded_text.contains(RECOVERED_TEXT),
+                "expected recovery within max_turns=2, so the retry must not consume a turn; yielded: {yielded_text}"
+            );
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 3);
+
+            let received = provider.received.lock().unwrap();
+            let retry_input = received.last().expect("provider should have been called");
+            assert_eq!(
+                count_content(retry_input, |c| matches!(c, MessageContent::ToolRequest(_))),
+                1,
+                "the retried request must still contain the completed tool request"
+            );
+            assert_eq!(
+                count_content(retry_input, |c| matches!(
+                    c,
+                    MessageContent::ToolResponse(_)
+                )),
+                1,
+                "the retried request must still contain the executed tool response"
+            );
+            assert!(
+                !concat_texts(retry_input).contains(PARTIAL_TEXT),
+                "the interrupted partial text must be dropped from the retried request"
+            );
+
+            assert_eq!(
+                count_content(&history, |c| matches!(c, MessageContent::ToolResponse(_))),
+                1,
+                "the tool must have executed exactly once"
+            );
+            assert!(concat_texts(&history).contains(RECOVERED_TEXT));
+            assert!(!concat_texts(&history).contains(PARTIAL_TEXT));
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
     mod tool_pair_summarization_tests {
         use super::*;
         use async_trait::async_trait;
